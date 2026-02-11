@@ -230,22 +230,15 @@ int main(int argc, char **argv) {
   fprintf(stderr, "  Done: %d measurements in %.2f s  (%.0f meas/s)\n", N,
           elapsed, N / elapsed);
 
-  /* --- Normalise → uint8 --- */
-  double mn = accum[0], mx = accum[0];
-  for (int i = 1; i < npix; i++) {
-    if (accum[i] < mn)
-      mn = accum[i];
-    if (accum[i] > mx)
-      mx = accum[i];
-  }
-  double range = mx - mn;
-  if (range < 1e-12)
-    range = 1.0;
-
+  /* --- Normalise: accum[i] / N ≈ pixel[i] --- */
   uint8_t *out = malloc(npix);
   for (int i = 0; i < npix; i++) {
-    double v = (accum[i] - mn) / range * 255.0;
-    out[i] = (uint8_t)(v < 0 ? 0 : v > 255 ? 255 : v + 0.5);
+    double v = accum[i] / (double)N;
+    if (v < 0.0)
+      v = 0.0;
+    if (v > 255.0)
+      v = 255.0;
+    out[i] = (uint8_t)(v + 0.5);
   }
 
   f = fopen(out_path, "wb");

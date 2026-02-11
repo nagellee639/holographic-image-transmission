@@ -140,7 +140,10 @@ def run_simulation() -> None:
                 raw_out = os.path.join(
                     RAW_DIR, f"{img_name}_{snr_tag}_{n_meas}.raw"
                 )
-                run_protocol(raw_in, n_meas, snr, raw_out)
+                if os.path.exists(raw_out):
+                    print(f"    Skipping {n_meas} (already exists)")
+                else:
+                    run_protocol(raw_in, n_meas, snr, raw_out)
 
                 recon = raw_to_array(raw_out)
                 p = psnr(original, recon)
