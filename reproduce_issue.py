@@ -1,57 +1,48 @@
 
 import numpy as np
-import sys
-import os
+from holo_api import HoloTx, GPU_AVAILABLE
 import ctypes
 
-# Import the module
-import alt_protocols
+def test_tx_uniqueness():
+    if not GPU_AVAILABLE:
+        print("Skipping GPU test (GPU not available)")
+        return
 
-def check_protocol(name, TxCls, RxCls):
-    print(f"\nChecking {name}...")
-    W, H = 64, 64
-    seed = 42
+    width, height = 64, 64
+    img = np.zeros((height, width), dtype=np.uint8)
+    # pattern
+    img[20:40, 20:40] = 255
     
-    # Create a simple pattern: Left half 0, Right half 255
-    img = np.zeros((H, W), dtype=np.float32)
-    img[:, 32:] = 255.0
+    print("Creating HoloTx...")
+    tx = HoloTx(seed=12345, width=width, height=height, image_array=img)
     
-    tx = TxCls(seed, W, H, img)
-    rx = RxCls(seed, W, H)
+    print("Generating batch 1 (Fast)...")
+    m1 = tx.generate(100, fast=True)
     
-    # Generate measurements
-    count = 10000
-    samples = tx.generate(count)
-    rx.accumulate(samples)
+    print("Generating batch 2 (Fast)...")
+    m2 = tx.generate(100, fast=True)
     
-    recon = rx.get_image()
-    
-    # Check stats
-    print(f"  Measurements: {len(samples)}")
-    print(f"  Recon stats: min={recon.min()}, max={recon.max()}, mean={recon.mean()}")
-    
-    # Check center pixels
-    mid_left = recon[32, 16]
-    mid_right = recon[32, 48]
-    print(f"  Left pixel (should be dark): {mid_left}")
-    print(f"  Right pixel (should be bright): {mid_right}")
-    
-    if recon.min() == 128 and recon.max() == 128:
-        print("  [FAIL] Image is completely gray (128)!")
-    elif mid_left > 50 or mid_right < 200:
-        print("  [WARN] Image contract is low.")
+    # Check if they are identical
+    if np.allclose(m1, m2):
+        print("[FAIL] Batch 1 and Batch 2 are IDENTICAL! Counter is likely resetting.")
     else:
-        print("  [PASS] Image looks plausible.")
-
-    # Check internal counts if possible
-    zero_counts = np.sum(rx.counts == 0)
-    print(f"  Pixels with 0 updates: {zero_counts}/{W*H} ({zero_counts/(W*H)*100:.1f}%)")
-
-def main():
-    print(f"Lib loaded: {alt_protocols._lib is not None}")
+        print("[PASS] Batch 1 and Batch 2 are different. Counter is working.")
+        
+    # Double check standard
+    print("Generating batch 3 (Standard)...")
+    m3 = tx.generate(100, fast=False)
+    print("Generating batch 4 (Standard)...")
+    m4 = tx.generate(100, fast=False)
     
-    check_protocol("Random Line", alt_protocols.LineTx, alt_protocols.LineRx)
-    check_protocol("Random Block", alt_protocols.BlockTx, alt_protocols.BlockRx)
+    if np.allclose(m3, m4):
+         print("[FAIL] Standard Batch 3 and 4 are IDENTICAL! (Unexpected for standard)")
+    else:
+         print("[PASS] Standard Batch 3 and 4 are different.")
+
+    tx.close()
 
 if __name__ == "__main__":
-    main()
+    try:
+        test_tx_uniqueness()
+    except Exception as e:
+        print(f"An error occurred: {e}")

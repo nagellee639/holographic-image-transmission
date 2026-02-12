@@ -173,7 +173,6 @@ struct SolverState {
   int type; // 1=CGLS (L2), 2=ISTA (L1)
   int width, height, npix;
   int n_meas;
-  int meas_offset; // Offset for fast solver
   uint64_t seed;
 
   cublasHandle_t cublas;
@@ -463,7 +462,7 @@ void rx_get_image(RxState *s, uint8_t *h_output, int total_measurements) {
  */
 __global__ void kernel_Ax_fast(const float *__restrict__ x,
                                float *__restrict__ b, int n_meas, int npix,
-                               uint64_t seed, int meas_offset) {
+                               uint64_t seed) {
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
   if (idx < n_meas) {
     float sum = 0.0f;
@@ -474,7 +473,7 @@ __global__ void kernel_Ax_fast(const float *__restrict__ x,
       float val = x[j];
       // Only multiply if x is non-zero (sparsity could help if we knew it, but
       // here dense) But branching might hurt. Let's just do it.
-      float mask = get_mask_val(seed, j, meas_offset + idx);
+      float mask = get_mask_val(seed, j, idx);
       sum += val * mask;
     }
     b[idx] = sum;
@@ -488,14 +487,14 @@ __global__ void kernel_Ax_fast(const float *__restrict__ x,
  */
 __global__ void kernel_ATy_fast(const float *__restrict__ y,
                                 float *__restrict__ x, int n_meas, int npix,
-                                uint64_t seed, int meas_offset) {
+                                uint64_t seed) {
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
   if (idx < npix) {
     float sum = 0.0f;
     // Loop over measurements
     for (int i = 0; i < n_meas; i++) {
       float val = y[i];
-      float mask = get_mask_val(seed, idx, meas_offset + i); // Same mask as Ax!
+      float mask = get_mask_val(seed, idx, i); // Same mask as Ax!
       sum += val * mask;
     }
     x[idx] = sum;
@@ -508,15 +507,13 @@ __global__ void kernel_ATy_fast(const float *__restrict__ y,
 static void ops_Ax_fast(SolverState *s, const float *d_x, float *d_ax) {
   int threads = 256;
   int blocks = (s->n_meas + threads - 1) / threads;
-  kernel_Ax_fast<<<blocks, threads>>>(d_x, d_ax, s->n_meas, s->npix, s->seed,
-                                      s->meas_offset);
+  kernel_Ax_fast<<<blocks, threads>>>(d_x, d_ax, s->n_meas, s->npix, s->seed);
 }
 
 static void ops_ATy_fast(SolverState *s, const float *d_y, float *d_aty) {
   int threads = 256;
   int blocks = (s->npix + threads - 1) / threads;
-  kernel_ATy_fast<<<blocks, threads>>>(d_y, d_aty, s->n_meas, s->npix, s->seed,
-                                       s->meas_offset);
+  kernel_ATy_fast<<<blocks, threads>>>(d_y, d_aty, s->n_meas, s->npix, s->seed);
 }
 
 // ----------------------------------------------------------------------
@@ -635,7 +632,6 @@ SolverState *solver_create_ls_fast(uint64_t seed, int width, int height,
   s->height = height;
   s->npix = width * height;
   s->n_meas = n_meas;
-  s->meas_offset = 0;   // Default
   s->curand_gen = NULL; // Initialize to NULL
 
   SAFE_CUBLAS(cublasCreate(&s->cublas));
@@ -688,7 +684,6 @@ SolverState *solver_create_l1_fast(uint64_t seed, int width, int height,
   s->npix = width * height;
   s->n_meas = n_meas;
   s->lambda = lambda;
-  s->meas_offset = 0;   // Default
   s->curand_gen = NULL; // Initialize to NULL
 
   // Estimate Lipschitz constant L.
@@ -696,13 +691,7 @@ SolverState *solver_create_l1_fast(uint64_t seed, int width, int height,
   // npix (upper bound?) Actually, spectral radius is approx N_meas for random
   // Bernoulli matrices if normalized. Our entries are +/-1. A column has norm^2
   // = n_meas. So Lipschitz L ≈ n_meas. Step size <= 1/L. Let's be conservative.
-  // Spectral radius of A^T A is approx n_meas for this random matrix.
-  // Standard ISTA step is 1/L.
-  // With L ~ n_meas, step should be < 1/n_meas.
-  // However, FISTA can be unstable if step is close to boundary.
-  // Empirical testing shows 0.5/n_meas diverges.
-  // Let's use 0.25 / n_meas.
-  s->t_step = 0.25f / (float)n_meas;
+  s->t_step = 0.5f / (float)n_meas;
 
   SAFE_CUBLAS(cublasCreate(&s->cublas));
 
@@ -1008,13 +997,9 @@ void solver_project_histogram(SolverState *s, const int *target_hist) {
     s->h_x_pinned[original_idx] = target_val;
   }
 
+  // 5. Upload x
   CHECK_CUDA(cudaMemcpy(s->d_x, s->h_x_pinned, s->npix * sizeof(float),
                         cudaMemcpyHostToDevice));
-}
-
-void solver_set_meas_offset(SolverState *s, int offset) {
-  if (s)
-    s->meas_offset = offset;
 }
 
 } /* extern C */

@@ -47,6 +47,19 @@ def psnr(original: np.ndarray, reconstructed: np.ndarray) -> float:
     return 10.0 * np.log10(255.0 ** 2 / mse)
 
 
+def ssim_metric(original: np.ndarray, reconstructed: np.ndarray) -> float:
+    """
+    Structural Similarity Index (SSIM) between two images.
+    Input images should be (H, W) or (H, W, C) in [0, 255].
+    """
+    from skimage.metrics import structural_similarity as ssim
+    
+    # Ensure float range [0, 255]? SKImage handles it if data_range is specified.
+    # We should cast to match types, but ssim handles arrays.
+    # Important: specify data_range=255 for correct scaling.
+    return ssim(original, reconstructed, data_range=255.0)
+
+
 def save_comparison(original: np.ndarray,
                     reconstructions: list[np.ndarray],
                     labels: list[str],
@@ -65,7 +78,8 @@ def save_comparison(original: np.ndarray,
     for ax, img, label in zip(axes[1:], reconstructions, labels):
         ax.imshow(img, cmap="gray", vmin=0, vmax=255)
         p = psnr(original, img)
-        ax.set_title(f"{label}\nPSNR {p:.1f} dB", fontsize=9)
+        s = ssim_metric(original, img)
+        ax.set_title(f"{label}\nPSNR {p:.1f} dB\nSSIM {s:.3f}", fontsize=9)
         ax.axis("off")
 
     if title:

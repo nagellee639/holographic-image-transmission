@@ -1,4 +1,4 @@
-from utils import psnr
+from utils import psnr, ssim_metric
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from PIL import Image, ImageTk
@@ -105,6 +105,7 @@ class HoloGUI:
         
         self.lock = threading.Lock()
         self.running = True # Global run flag
+        self.solver_running = False
         
         # Metrics
         self.tx_samples_last = 0
@@ -274,81 +275,198 @@ class HoloGUI:
         sep_ls = ttk.Separator(f, orient=tk.HORIZONTAL)
         sep_ls.pack(fill=tk.X, pady=10, padx=20)
         
-        self.btn_ls = ttk.Button(f, text="Refine (Least Squares)", command=self.run_ls_solver)
+        ttk.Label(f, text="Solver Algorithm:").pack()
+        self.var_solver_type = tk.StringVar(value="L2: CGLS (Fast)")
+        opts = [
+            "L2: CGLS (Fast)", 
+            "L2: CGLS (Standard)", 
+            "L1: FISTA (Fast)", 
+            "L1: ISTA (Standard)"
+        ]
+        om_sol = ttk.OptionMenu(f, self.var_solver_type, opts[0], *opts)
+        om_sol.pack(pady=2)
+        
+        self.var_hist = tk.BooleanVar(value=False)
+        c_hist = ttk.Checkbutton(f, text="Enforce Histogram (Cheat)", variable=self.var_hist)
+        c_hist.pack(pady=2)
+        
+        
+        self.btn_ls = ttk.Button(f, text="Start Solver (Continuous)", command=self.toggle_reconstruction)
         self.btn_ls.pack(pady=5)
+        
+        f_stops = ttk.Frame(f)
+        f_stops.pack(pady=2)
+        self.btn_stop_now = ttk.Button(f_stops, text="Stop NOW", command=self.stop_solver_now, state="disabled")
+        self.btn_stop_now.pack(side=tk.LEFT, padx=2)
+        self.btn_stop_after = ttk.Button(f_stops, text="Stop Next", command=self.stop_solver_after, state="disabled")
+        self.btn_stop_after.pack(side=tk.LEFT, padx=2)
+        
+        self.progress = ttk.Progressbar(f, orient=tk.HORIZONTAL, length=200, mode='determinate')
+        self.progress.pack(pady=5)
+        
+        self.lbl_iter_time = ttk.Label(f, text="Time/Iter: --")
+        self.lbl_iter_time.pack(pady=2)
         
         self.chunk_size = 2048
 
-    def run_ls_solver(self):
+    def toggle_reconstruction(self):
+        if self.solver_running:
+            self.stop_solver_now()
+        else:
+            self.start_reconstruction()
+
+    def start_reconstruction(self):
         if not self.rx or not GPU_AVAILABLE:
             messagebox.showwarning("Unavailable", "Receiver not ready or GPU not available.")
             return
 
-        if self.rx.measurements_count < 100:
-             messagebox.showwarning("Not enough data", "Need more measurements for Least Squares.")
+        if self.rx.measurements_count < 50: # Lower threshold for testing
+             messagebox.showwarning("Not enough data", "Need more measurements.")
              return
              
-        # Disable button
-        self.btn_ls.config(state="disabled", text="Solving... (Please Wait)")
+        # Disable start button, Enable stop buttons
+        self.btn_ls.config(text="Stop Reconstruction")
+        self.btn_stop_now.config(state="normal")
+        self.btn_stop_after.config(state="normal")
+        self.progress['mode'] = 'indeterminate'
+        self.progress.start()
         
-        # Gather data in main thread
+        self.solver_running = True
+        self.stop_immediate = False
+        self.stop_requested = False
+        
+        # Gather data
         try:
             if not self.audio_chunks:
-                self.btn_ls.config(state="normal", text="Refine (Least Squares)")
+                self.btn_ls.config(text="Start Solver (Continuous)")
                 return
             full_meas = np.concatenate(self.audio_chunks)
             if self.valid_samples > len(full_meas):
                 self.valid_samples = len(full_meas)
             meas_to_solve = full_meas[:self.valid_samples]
+            
+            # Prepare Histogram if requested
+            hist = None
+            if self.var_hist.get():
+                if hasattr(self, 'tx_img') and self.tx_img is not None:
+                    # Normalized histogram (count per bin)
+                    print("[DEBUG] Calculating source histogram...")
+                    hist, _ = np.histogram(self.tx_img, bins=256, range=(0, 255))
+                    hist = hist.astype(np.int32)
+                else:
+                    print("[WARN] No source image to calc histogram!")
         except Exception as e:
             print(f"[ERROR] Data prep failed: {e}")
-            self.btn_ls.config(state="normal", text="Refine (Least Squares)")
+            self.btn_ls.config(text="Start Solver (Continuous)")
             return
             
         # Run in thread
-        threading.Thread(target=self._ls_thread, args=(meas_to_solve,), daemon=True).start()
+        threading.Thread(target=self._solver_thread, args=(meas_to_solve, hist), daemon=True).start()
 
-    def _ls_thread(self, measurements):
+    def _solver_thread(self, measurements, histogram):
         try:
-            print(f"[DEBUG] Running LS Solver on {len(measurements)} measurements...")
-            t0 = time.time()
-            # Iterations decreased to 15 for responsiveness, as 150k measurements is heavy
-            img = self.rx.solve_ls(measurements, iterations=15, tol=1e-6)
-            dt = time.time() - t0
-            print(f"[DEBUG] LS Solve finished in {dt:.2f} s")
+            print(f"[DEBUG] Starting Solver on {len(measurements)} measurements...")
             
-            # Callback to main thread for UI update
-            self.root.after(0, lambda: self._ls_complete(img, dt))
+            mode = self.var_solver_type.get()
+            
+            # Determine Solver params based on explicit mode string
+            solver = None
+            if "CGLS" in mode:
+                fast = "Fast" in mode
+                print(f"[DEBUG] Creating CGLS Solver (Fast={fast})")
+                solver = self.rx.create_solver_ls(measurements, fast=fast)
+            elif "L1" in mode: # ISTA or FISTA
+                fast = "FISTA" in mode or "Fast" in mode
+                # Note: FISTA is the Fast implementation of L1
+                print(f"[DEBUG] Creating L1 Solver (Fast={fast})")
+                solver = self.rx.create_solver_l1(measurements, lambda_val=0.5, fast=fast)
+            
+            # Continuous Loop
+            i = 0
+            start_time = time.time() # FIX: Start time was missing
+            while self.solver_running and self.running:
+                iter_start = time.time()
+                
+                # Check Immediate Stop
+                if self.stop_immediate:
+                    print("[DEBUG] Stop Immediate requested")
+                    break
+                
+                # Step
+                solver.step()
+                
+                # Force Histogram?
+                if histogram is not None and (i+1) % 5 == 0:
+                    solver.project_histogram(histogram)
+                
+                iter_dt = time.time() - iter_start
+                
+                # Update UI every frame (or every N)
+                if (i+1) % 1 == 0:
+                    img = solver.get_image()
+                    # Push update to main thread
+                    self.root.after(0, lambda image=img, dt=iter_dt: self._update_solver_view(image, dt))
+                    
+                # Check Graceful Stop
+                if self.stop_requested:
+                    print("[DEBUG] Stop After Iteration requested")
+                    break
+                
+                i += 1
+            
+            solver.close()
+            dt = time.time() - start_time
+            print(f"[DEBUG] Solved in {dt:.2f}s ({i} iterations)")
+            self.root.after(0, lambda: self._solver_complete(dt, i))
             
         except Exception as e:
-            print(f"[ERROR] LS Solver failed: {e}")
-            self.root.after(0, lambda: messagebox.showerror("LS Error", str(e)))
-            self.root.after(0, lambda: self.btn_ls.config(state="normal", text="Refine (Least Squares)"))
+            print(f"[ERROR] Solver thread failed: {e}")
+            import traceback
+            traceback.print_exc()
+            self.root.after(0, lambda: messagebox.showerror("Solver Error", str(e)))
+            self.root.after(0, lambda: self._reset_solver_ui())
 
-    def _ls_complete(self, img, dt):
+    def _update_solver_view(self, img, iter_dt):
         try:
-            # Display
             pil = Image.fromarray(img)
             disp = pil.resize((320,240))
             self.rx_ph = ImageTk.PhotoImage(disp)
             self.cv_rx.create_image(160,120, image=self.rx_ph)
             
-            # PSNR
-            p_val = 0.0
+            # Update timing label
+            self.lbl_iter_time.config(text=f"Time/Iter: {iter_dt*1000:.1f} ms")
+            
+            # Calc PSNR & SSIM
             if hasattr(self, 'tx_img') and self.tx_img is not None:
                 if self.tx_img.shape == img.shape:
                     try:
-                        p_val = psnr(self.tx_img, img)
+                        p = psnr(self.tx_img, img)
+                        s = ssim_metric(self.tx_img, img)
+                        self.lbl_psnr.config(text=f"PSNR: {p:.2f} dB | SSIM: {s:.3f}")
                     except:
                         pass
-            
-            self.lbl_psnr.config(text=f"PSNR (LS): {p_val:.2f} dB")
-            messagebox.showinfo("Complete", f"Refinement finished in {dt:.1f}s\nPSNR: {p_val:.2f} dB")
-            
-        except Exception as e:
-            print(f"[ERROR] UI Update failed: {e}")
-            
-        self.btn_ls.config(state="normal", text="Refine (Least Squares)")
+        except:
+            pass
+
+    def _solver_complete(self, dt, iters):
+        self._reset_solver_ui()
+        messagebox.showinfo("Done", f"Stopped after {iters} iterations\nTotal time: {dt:.2f}s")
+        
+    def _reset_solver_ui(self):
+        self.solver_running = False
+        self.btn_ls.config(state="normal", text="Start Solver (Continuous)")
+        self.btn_stop_now.config(state="disabled")
+        self.btn_stop_after.config(state="disabled")
+        self.progress.stop()
+        self.progress['mode'] = 'determinate'
+        self.progress['value'] = 0
+
+    def stop_solver_now(self):
+        self.stop_immediate = True
+        
+    def stop_solver_after(self):
+        self.stop_requested = True
+        self.btn_stop_after.config(text="Stopping...", state="disabled")
 
     def get_audio_slice(self, length):
         """Efficiently get last 'length' samples from audio_chunks"""
@@ -496,7 +614,7 @@ class HoloGUI:
             while self.is_transmitting and self.running:
                 t0 = time.time()
                 # print("[DEBUG] Generating chunk...")
-                data = self.tx.generate(chunk) # float32
+                data, offset = self.tx.generate(chunk) # float32, offset
                 
                 # Apply Channel Effects
                 tx_audio = self.channel.apply(data)
