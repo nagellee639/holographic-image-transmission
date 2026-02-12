@@ -36,6 +36,7 @@
 
 #define BATCH_SIZE 512 /* masks per batch — fits comfortably in P1000's 4GB */
 
+/* Fatal versions — used in processing paths where we can't recover */
 #define CHECK_CUDA(call)                                                       \
   do {                                                                         \
     cudaError_t e = (call);                                                    \
@@ -59,6 +60,33 @@
     if (e != CUBLAS_STATUS_SUCCESS) {                                          \
       fprintf(stderr, "cuBLAS error %s:%d: %d\n", __FILE__, __LINE__, e);      \
       exit(1);                                                                 \
+    }                                                                          \
+  } while (0)
+
+/* Safe versions — return NULL on failure instead of exit(1) */
+#define SAFE_CUDA(call)                                                        \
+  do {                                                                         \
+    cudaError_t e = (call);                                                    \
+    if (e != cudaSuccess) {                                                    \
+      fprintf(stderr, "CUDA error %s:%d: %s\n", __FILE__, __LINE__,            \
+              cudaGetErrorString(e));                                          \
+      goto fail;                                                               \
+    }                                                                          \
+  } while (0)
+#define SAFE_CURAND(call)                                                      \
+  do {                                                                         \
+    curandStatus_t e = (call);                                                 \
+    if (e != CURAND_STATUS_SUCCESS) {                                          \
+      fprintf(stderr, "cuRAND error %s:%d: %d\n", __FILE__, __LINE__, e);      \
+      goto fail;                                                               \
+    }                                                                          \
+  } while (0)
+#define SAFE_CUBLAS(call)                                                      \
+  do {                                                                         \
+    cublasStatus_t e = (call);                                                 \
+    if (e != CUBLAS_STATUS_SUCCESS) {                                          \
+      fprintf(stderr, "cuBLAS error %s:%d: %d\n", __FILE__, __LINE__, e);      \
+      goto fail;                                                               \
     }                                                                          \
   } while (0)
 
@@ -117,21 +145,34 @@ TxState *tx_create(uint64_t seed, int width, int height, const float *h_image) {
   s->width = width;
   s->height = height;
   s->npix = width * height;
-
-  CHECK_CUBLAS(cublasCreate(&s->cublas));
-  CHECK_CURAND(
-      curandCreateGenerator(&s->curand_gen, CURAND_RNG_PSEUDO_DEFAULT));
-  CHECK_CURAND(curandSetPseudoRandomGeneratorSeed(s->curand_gen, seed));
-
-  CHECK_CUDA(cudaMalloc(&s->d_image, s->npix * sizeof(float)));
-  CHECK_CUDA(cudaMemcpy(s->d_image, h_image, s->npix * sizeof(float),
-                        cudaMemcpyHostToDevice));
-
+  s->d_image = NULL;
+  s->d_masks = NULL;
+  s->d_meas = NULL;
   size_t max_batch = BATCH_SIZE;
-  CHECK_CUDA(cudaMalloc(&s->d_masks, max_batch * s->npix * sizeof(float)));
-  CHECK_CUDA(cudaMalloc(&s->d_meas, max_batch * sizeof(float)));
+
+  SAFE_CUBLAS(cublasCreate(&s->cublas));
+  SAFE_CURAND(curandCreateGenerator(&s->curand_gen, CURAND_RNG_PSEUDO_DEFAULT));
+  SAFE_CURAND(curandSetPseudoRandomGeneratorSeed(s->curand_gen, seed));
+
+  SAFE_CUDA(cudaMalloc(&s->d_image, s->npix * sizeof(float)));
+  SAFE_CUDA(cudaMemcpy(s->d_image, h_image, s->npix * sizeof(float),
+                       cudaMemcpyHostToDevice));
+
+  SAFE_CUDA(cudaMalloc(&s->d_masks, max_batch * s->npix * sizeof(float)));
+  SAFE_CUDA(cudaMalloc(&s->d_meas, max_batch * sizeof(float)));
 
   return s;
+
+fail:
+  fprintf(stderr, "[WARN] GPU TX init failed, returning NULL\n");
+  if (s->d_image)
+    cudaFree(s->d_image);
+  if (s->d_masks)
+    cudaFree(s->d_masks);
+  if (s->d_meas)
+    cudaFree(s->d_meas);
+  delete s;
+  return NULL;
 }
 
 void tx_destroy(TxState *s) {
@@ -181,20 +222,33 @@ RxState *rx_create(uint64_t seed, int width, int height) {
   s->width = width;
   s->height = height;
   s->npix = width * height;
-
-  CHECK_CUBLAS(cublasCreate(&s->cublas));
-  CHECK_CURAND(
-      curandCreateGenerator(&s->curand_gen, CURAND_RNG_PSEUDO_DEFAULT));
-  CHECK_CURAND(curandSetPseudoRandomGeneratorSeed(s->curand_gen, seed));
-
-  CHECK_CUDA(cudaMalloc(&s->d_accum, s->npix * sizeof(float)));
-  CHECK_CUDA(cudaMemset(s->d_accum, 0, s->npix * sizeof(float)));
-
+  s->d_accum = NULL;
+  s->d_masks = NULL;
+  s->d_meas = NULL;
   size_t max_batch = BATCH_SIZE;
-  CHECK_CUDA(cudaMalloc(&s->d_masks, max_batch * s->npix * sizeof(float)));
-  CHECK_CUDA(cudaMalloc(&s->d_meas, max_batch * sizeof(float)));
+
+  SAFE_CUBLAS(cublasCreate(&s->cublas));
+  SAFE_CURAND(curandCreateGenerator(&s->curand_gen, CURAND_RNG_PSEUDO_DEFAULT));
+  SAFE_CURAND(curandSetPseudoRandomGeneratorSeed(s->curand_gen, seed));
+
+  SAFE_CUDA(cudaMalloc(&s->d_accum, s->npix * sizeof(float)));
+  SAFE_CUDA(cudaMemset(s->d_accum, 0, s->npix * sizeof(float)));
+
+  SAFE_CUDA(cudaMalloc(&s->d_masks, max_batch * s->npix * sizeof(float)));
+  SAFE_CUDA(cudaMalloc(&s->d_meas, max_batch * sizeof(float)));
 
   return s;
+
+fail:
+  fprintf(stderr, "[WARN] GPU RX init failed, returning NULL\n");
+  if (s->d_accum)
+    cudaFree(s->d_accum);
+  if (s->d_masks)
+    cudaFree(s->d_masks);
+  if (s->d_meas)
+    cudaFree(s->d_meas);
+  delete s;
+  return NULL;
 }
 
 void rx_destroy(RxState *s) {

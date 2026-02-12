@@ -14,7 +14,12 @@ except OSError:
     AUDIO_AVAILABLE = False
 import scipy.io.wavfile as wavfile
 import os
-from holo_api import HoloTx, HoloRx
+from holo_api import GPU_AVAILABLE
+if GPU_AVAILABLE:
+    from holo_api import HoloTx, HoloRx
+else:
+    from holo_api import HoloTxCPU as HoloTx, HoloRxCPU as HoloRx
+from alt_protocols import PROTOCOLS as ALT_PROTOCOLS, PixelTx, PixelRx
 
 # Radio Modes: Name -> Sample Rate (Hz)
 MODES = {
@@ -22,6 +27,59 @@ MODES = {
     "SSB (3 kHz)": 3000,
     "FM (12 kHz)": 12000
 }
+
+class RadioChannel:
+    """Simulates HF/VHF radio channel impairments"""
+    def __init__(self, sample_rate):
+        self.sr = sample_rate
+        self.snr_db = None # None = Perfect
+        self.fading = False
+        self.multipath = False
+        self.t = 0.0
+        
+    def apply(self, audio_chunk):
+        """Apply active effects to float32 audio chunk"""
+        if self.snr_db is None and not self.fading and not self.multipath:
+            return audio_chunk # Bypass
+            
+        out = audio_chunk.copy()
+        N = len(out)
+        t_vec = np.arange(N) / self.sr + self.t
+        self.t += N / self.sr
+        
+        # 1. Multipath (Simple Echo)
+        if self.multipath:
+            # 2ms delay = ~24 samples at 12k
+            delay_samples = int(0.002 * self.sr)
+            if delay_samples > 0:
+                # Naive echo (circular for simplicity in chunk, ideal needs state)
+                # Just adding a phase-shifted copy
+                echo = np.roll(out, delay_samples) * 0.4
+                out += echo
+        
+        # 2. Fading (QSB) - Slow amplitude modulation (0.2 Hz)
+        if self.fading:
+            # 0.5 + 0.5*sin(2pi*0.2*t) -> vary 0.0 to 1.0? 
+            # Real QSB is log-normal, but sine is okay for demo.
+            envelope = 0.6 + 0.4 * np.sin(2 * np.pi * 0.2 * t_vec)
+            out *= envelope.astype(np.float32)
+            
+        # 3. AWGN Noise
+        if self.snr_db is not None:
+             # Signal power? Assume signal is normalized ~1.0 peak
+             # Average power of uniform/random signal ~ 0.3-0.5?
+             # Let's assume P_signal = 0.5
+             sig_p = np.mean(out**2)
+             if sig_p > 1e-9:
+                 sig_db = 10 * np.log10(sig_p)
+                 noise_db = sig_db - self.snr_db
+                 noise_p = 10**(noise_db/10)
+                 noise_std = np.sqrt(noise_p)
+                 
+                 noise = np.random.normal(0, noise_std, size=N).astype(np.float32)
+                 out += noise
+        
+        return out
 
 class HoloGUI:
     def __init__(self, root):
@@ -42,6 +100,8 @@ class HoloGUI:
         self.play_pos = 0 # absolute sample index
         self.rx_pos = 0   # absolute sample index processed by RX
         self.audio_buffer = None # Flattened array for playback
+        
+        self.channel = RadioChannel(self.sample_rate)
         
         self.lock = threading.Lock()
         self.running = True # Global run flag
@@ -119,6 +179,31 @@ class HoloGUI:
         for m in MODES:
             r = ttk.Radiobutton(f, text=m, variable=self.var_mode, value=m, command=self.set_mode)
             r.pack()
+        
+        # --- Protocol Selection ---
+        sep_proto = ttk.Separator(f, orient=tk.HORIZONTAL)
+        sep_proto.pack(fill=tk.X, pady=10, padx=20)
+        
+        ttk.Label(f, text="Protocol:").pack()
+        self.var_proto = tk.StringVar(value="Dense Holographic")
+        proto_opts = ["Dense Holographic", "Random Pixel", "Random Line", "Random Block"]
+        om_proto = ttk.OptionMenu(f, self.var_proto, proto_opts[0], *proto_opts)
+        om_proto.pack(pady=5)
+            
+        # --- Channel Sim ---
+        sep2 = ttk.Separator(f, orient=tk.HORIZONTAL)
+        sep2.pack(fill=tk.X, pady=10, padx=20)
+        
+        ttk.Label(f, text="Channel Condition (SNR):").pack()
+        self.var_snr = tk.StringVar(value="Perfect")
+        snr_opts = ["Perfect", "Strong (30dB)", "Moderate (20dB)", "Weak (10dB)", "Deep Fade (0dB)"]
+        om = ttk.OptionMenu(f, self.var_snr, snr_opts[0], *snr_opts, command=self.update_channel)
+        om.pack(pady=5)
+        
+        self.var_qsb = tk.BooleanVar(value=False)
+        c_qsb = ttk.Checkbutton(f, text="Fading & Multipath (QSB)", variable=self.var_qsb, command=self.update_channel)
+        c_qsb.pack()
+        # -------------------
             
         self.btn_tx = ttk.Button(f, text="Start Encoding (TX)", command=self.toggle_tx)
         self.btn_tx.pack(pady=20)
@@ -213,12 +298,27 @@ class HoloGUI:
 
     # --- Logic ---
 
+    # Supported image extensions for load_image validation
+    SUPPORTED_IMAGE_EXTS = {'.png', '.jpg', '.jpeg', '.bmp', '.gif', '.tiff', '.tif', '.webp'}
+
     def load_image(self, p=None):
         if not p:
             print("[DEBUG] Opening file dialog...")
             p = filedialog.askopenfilename()
         
         if not p: return
+
+        # Validate file exists
+        if not os.path.exists(p):
+            messagebox.showerror("Error", f"File not found: {p}")
+            return
+
+        # Validate file extension
+        _, ext = os.path.splitext(p)
+        if ext.lower() not in self.SUPPORTED_IMAGE_EXTS:
+            messagebox.showerror("Error", f"Unsupported image format: '{ext}'\nSupported: {', '.join(sorted(self.SUPPORTED_IMAGE_EXTS))}")
+            return
+
         try:
             print(f"[DEBUG] Loading image: {p}")
             pil = Image.open(p).convert("L").resize((640,480), Image.LANCZOS)
@@ -234,19 +334,40 @@ class HoloGUI:
                 print("[DEBUG] Closing existing TX")
                 self.tx.close()
             
-            print("[DEBUG] Creating HoloTx...")
-            self.tx = HoloTx(42, 640, 480, self.tx_img)
-            print("[DEBUG] HoloTx created. Resetting RX...")
+            proto = self.var_proto.get()
+            print(f"[DEBUG] Creating TX with protocol: {proto}")
+            if proto == "Dense Holographic":
+                self.tx = HoloTx(42, 640, 480, self.tx_img)
+            else:
+                TxCls, _ = ALT_PROTOCOLS[proto]
+                self.tx = TxCls(42, 640, 480, self.tx_img)
+            print("[DEBUG] TX created. Resetting RX...")
             self.reset_rx()
             print("[DEBUG] RX reset done.")
             
             self.lbl_tx_status.config(text="Ready")
         except Exception as e:
-            messagebox.showerror("Error", str(e))
+            print(f"[ERROR] load_image failed: {e}")
+            messagebox.showerror("Error", f"Failed to load image: {e}")
 
     def set_mode(self):
         self.sample_rate = MODES[self.var_mode.get()]
         self.lbl_tx_status.config(text=f"Rate: {self.sample_rate} Hz")
+        self.channel.sr = self.sample_rate
+        
+    def update_channel(self, _=None):
+        # Parse SNR
+        s = self.var_snr.get()
+        if "Perfect" in s: self.channel.snr_db = None
+        elif "30dB" in s: self.channel.snr_db = 30
+        elif "20dB" in s: self.channel.snr_db = 20
+        elif "10dB" in s: self.channel.snr_db = 10
+        elif "0dB" in s: self.channel.snr_db = 0
+        
+        # Effects
+        self.channel.fading = self.var_qsb.get()
+        self.channel.multipath = self.var_qsb.get() # Link for simplicity
+        print(f"[DEBUG] Channel Updated: SNR={self.channel.snr_db}, Fading={self.channel.fading}")
 
     def toggle_tx(self):
         if not self.tx: return
@@ -264,8 +385,18 @@ class HoloGUI:
             # This matches the RX which resets on Play start.
             if hasattr(self, 'tx_img'):
                 if self.tx: self.tx.close()
-                print("[DEBUG] Re-creating HoloTx for sync...")
-                self.tx = HoloTx(42, 640, 480, self.tx_img)
+                proto = self.var_proto.get()
+                print(f"[DEBUG] Re-creating TX ({proto}) for sync...")
+                try:
+                    if proto == "Dense Holographic":
+                        self.tx = HoloTx(42, 640, 480, self.tx_img)
+                    else:
+                        TxCls, _ = ALT_PROTOCOLS[proto]
+                        self.tx = TxCls(42, 640, 480, self.tx_img)
+                except Exception as e:
+                    print(f"[ERROR] Failed to create TX: {e}")
+                    messagebox.showerror("GPU Error", f"Failed to initialize transmitter:\n{e}")
+                    return
             
             # Clear buffer for new transmission
             with self.lock:
@@ -287,9 +418,12 @@ class HoloGUI:
                 # print("[DEBUG] Generating chunk...")
                 data = self.tx.generate(chunk) # float32
                 
+                # Apply Channel Effects
+                tx_audio = self.channel.apply(data)
+                
                 with self.lock:
-                    self.audio_chunks.append(data)
-                    self.valid_samples += len(data)
+                    self.audio_chunks.append(tx_audio)
+                    self.valid_samples += len(tx_audio)
                 
                 dt = chunk / self.sample_rate
                 elapsed = time.time() - t0
@@ -326,6 +460,9 @@ class HoloGUI:
             # Prepare buffer for playback (flatten once)
             # This simplifies callback logic immensely
             try:
+                if not self.audio_chunks:
+                    print("[WARN] audio_chunks is empty, cannot play")
+                    return
                 self.audio_buffer = np.concatenate(self.audio_chunks)
             except Exception as e:
                 print(f"[ERROR] Failed to flatten audio: {e}")
@@ -451,7 +588,18 @@ class HoloGUI:
     def reset_rx(self):
         if self.rx: self.rx.close()
         # Seed 42 matches TX
-        self.rx = HoloRx(42, 640, 480)
+        proto = self.var_proto.get()
+        try:
+            if proto == "Dense Holographic":
+                self.rx = HoloRx(42, 640, 480)
+            else:
+                _, RxCls = ALT_PROTOCOLS[proto]
+                self.rx = RxCls(42, 640, 480)
+        except Exception as e:
+            print(f"[ERROR] Failed to create RX: {e}")
+            self.rx = None
+            messagebox.showerror("GPU Error", f"Failed to initialize receiver:\n{e}")
+            return
         self.rx_pos = 0
         self.cv_rx.delete("all")
         self.lbl_rx.config(text="Measurements: 0")
