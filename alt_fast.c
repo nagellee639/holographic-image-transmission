@@ -24,14 +24,18 @@ static float line_average(const float *img, int width, int height, int x0,
   int sx = x0 < x1 ? 1 : -1;
   int sy = y0 < y1 ? 1 : -1;
   int err = dx - dy;
+  int loop_count = 0;
+  int max_loops = dx + dy + 100; // Safety guard
 
-  while (1) {
+  while (loop_count++ < max_loops) {
     if (x0 >= 0 && x0 < width && y0 >= 0 && y0 < height) {
       sum += img[y0 * width + x0];
       count++;
     }
+
     if (x0 == x1 && y0 == y1)
       break;
+
     int e2 = 2 * err;
     if (e2 > -dy) {
       err -= dy;
@@ -69,15 +73,19 @@ void line_rx_batch(double *accum, int *counts, int width, int height,
     int sx = x0 < x1 ? 1 : -1;
     int sy = y0 < y1 ? 1 : -1;
     int err = dx - dy;
+    int loop_count = 0;
+    int max_loops = dx + dy + 100; // Safety guard
 
-    while (1) {
+    while (loop_count++ < max_loops) {
       if (x0 >= 0 && x0 < width && y0 >= 0 && y0 < height) {
         int idx = y0 * width + x0;
         accum[idx] += val;
         counts[idx]++;
       }
+
       if (x0 == x1 && y0 == y1)
         break;
+
       int e2 = 2 * err;
       if (e2 > -dy) {
         err -= dy;

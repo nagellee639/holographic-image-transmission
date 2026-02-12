@@ -1,4 +1,4 @@
-
+from utils import psnr
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from PIL import Image, ImageTk
@@ -261,6 +261,9 @@ class HoloGUI:
         self.lbl_rx_rate = ttk.Label(f, text="RX Rate: 0 S/s")
         self.lbl_rx_rate.pack()
         
+        self.lbl_psnr = ttk.Label(f, text="PSNR: 0.00 dB")
+        self.lbl_psnr.pack()
+        
         btn = ttk.Button(f, text="Reset Receiver", command=self.reset_rx)
         btn.pack(pady=10)
         
@@ -268,7 +271,84 @@ class HoloGUI:
         c = ttk.Checkbutton(f, text="Live Decode", variable=self.var_live)
         c.pack()
         
+        sep_ls = ttk.Separator(f, orient=tk.HORIZONTAL)
+        sep_ls.pack(fill=tk.X, pady=10, padx=20)
+        
+        self.btn_ls = ttk.Button(f, text="Refine (Least Squares)", command=self.run_ls_solver)
+        self.btn_ls.pack(pady=5)
+        
         self.chunk_size = 2048
+
+    def run_ls_solver(self):
+        if not self.rx or not GPU_AVAILABLE:
+            messagebox.showwarning("Unavailable", "Receiver not ready or GPU not available.")
+            return
+
+        if self.rx.measurements_count < 100:
+             messagebox.showwarning("Not enough data", "Need more measurements for Least Squares.")
+             return
+             
+        # Disable button
+        self.btn_ls.config(state="disabled", text="Solving... (Please Wait)")
+        
+        # Gather data in main thread
+        try:
+            if not self.audio_chunks:
+                self.btn_ls.config(state="normal", text="Refine (Least Squares)")
+                return
+            full_meas = np.concatenate(self.audio_chunks)
+            if self.valid_samples > len(full_meas):
+                self.valid_samples = len(full_meas)
+            meas_to_solve = full_meas[:self.valid_samples]
+        except Exception as e:
+            print(f"[ERROR] Data prep failed: {e}")
+            self.btn_ls.config(state="normal", text="Refine (Least Squares)")
+            return
+            
+        # Run in thread
+        threading.Thread(target=self._ls_thread, args=(meas_to_solve,), daemon=True).start()
+
+    def _ls_thread(self, measurements):
+        try:
+            print(f"[DEBUG] Running LS Solver on {len(measurements)} measurements...")
+            t0 = time.time()
+            # Iterations decreased to 15 for responsiveness, as 150k measurements is heavy
+            img = self.rx.solve_ls(measurements, iterations=15, tol=1e-6)
+            dt = time.time() - t0
+            print(f"[DEBUG] LS Solve finished in {dt:.2f} s")
+            
+            # Callback to main thread for UI update
+            self.root.after(0, lambda: self._ls_complete(img, dt))
+            
+        except Exception as e:
+            print(f"[ERROR] LS Solver failed: {e}")
+            self.root.after(0, lambda: messagebox.showerror("LS Error", str(e)))
+            self.root.after(0, lambda: self.btn_ls.config(state="normal", text="Refine (Least Squares)"))
+
+    def _ls_complete(self, img, dt):
+        try:
+            # Display
+            pil = Image.fromarray(img)
+            disp = pil.resize((320,240))
+            self.rx_ph = ImageTk.PhotoImage(disp)
+            self.cv_rx.create_image(160,120, image=self.rx_ph)
+            
+            # PSNR
+            p_val = 0.0
+            if hasattr(self, 'tx_img') and self.tx_img is not None:
+                if self.tx_img.shape == img.shape:
+                    try:
+                        p_val = psnr(self.tx_img, img)
+                    except:
+                        pass
+            
+            self.lbl_psnr.config(text=f"PSNR (LS): {p_val:.2f} dB")
+            messagebox.showinfo("Complete", f"Refinement finished in {dt:.1f}s\nPSNR: {p_val:.2f} dB")
+            
+        except Exception as e:
+            print(f"[ERROR] UI Update failed: {e}")
+            
+        self.btn_ls.config(state="normal", text="Refine (Least Squares)")
 
     def get_audio_slice(self, length):
         """Efficiently get last 'length' samples from audio_chunks"""
@@ -677,34 +757,43 @@ class HoloGUI:
                     # If Playing history (target < valid_samples), get_audio_slice returns future data.
                     
                     # So:
-                    pending = None
-                    if self.is_transmitting and not self.is_playing:
-                        # We are at the tip.
-                        if needed > 0:
-                             pending = self.get_audio_slice(needed)
-                    else:
-                        # History playback. Fallback to concat or simple indexing if small.
-                        # If large history playback is needed, we need a better structure.
-                        # For now, let's just concat if we are playing history.
-                        # Most likely user monitors live.
-                        if self.audio_chunks:
-                            full = np.concatenate(self.audio_chunks)
-                            if target <= len(full):
-                                pending = full[self.rx_pos : target]
-                
-                if pending is not None and len(pending) > 0:
                     try:
-                        self.rx.accumulate(pending)
-                        self.rx_pos = target
+                        # Logic to extract correct pending chunk
+                        if self.is_transmitting and not self.is_playing:
+                            # Live transmission - take new data
+                            if needed > 0:
+                                pending = self.get_audio_slice(needed)
+                        else:
+                            # Playback - take from full buffer
+                            if self.audio_chunks:
+                                full = np.concatenate(self.audio_chunks)
+                                if target <= len(full):
+                                    pending = full[self.rx_pos : target]
                         
-                        # Update Image
-                        if self.is_playing or self.is_transmitting or self.rx_pos % 5000 == 0:
-                             img = self.rx.get_image()
-                             pil = Image.fromarray(img)
-                             disp = pil.resize((320,240))
-                             self.rx_ph = ImageTk.PhotoImage(disp)
-                             self.cv_rx.create_image(160,120, image=self.rx_ph)
-                             self.lbl_rx.config(text=f"Measurements: {self.rx.measurements_count}")
+                        if pending is not None and len(pending) > 0:
+                            self.rx.accumulate(pending)
+                            self.rx_pos = target
+                            
+                            # Update Image
+                            if self.is_playing or self.is_transmitting or self.rx_pos % 5000 == 0:
+                                img = self.rx.get_image()
+                                pil = Image.fromarray(img)
+                                disp = pil.resize((320,240))
+                                self.rx_ph = ImageTk.PhotoImage(disp)
+                                self.cv_rx.create_image(160,120, image=self.rx_ph)
+                                
+                                # Calculate PSNR
+                                p_val = 0.0
+                                if hasattr(self, 'tx_img') and self.tx_img is not None:
+                                    # Ensure dimensions match
+                                    if self.tx_img.shape == img.shape:
+                                        try:
+                                            p_val = psnr(self.tx_img, img)
+                                        except:
+                                            pass
+                                
+                                self.lbl_rx.config(text=f"Measurements: {self.rx.measurements_count}")
+                                self.lbl_psnr.config(text=f"PSNR: {p_val:.2f} dB")
                     except Exception as e:
                         print(f"[ERROR] RX update failed: {e}")
 

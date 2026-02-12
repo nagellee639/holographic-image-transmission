@@ -137,6 +137,82 @@ struct RxState {
   cublasHandle_t cublas;
 };
 
+/* -----------------------------------------------------------------------
+ * CGLS Solver (Conjugate Gradient Least Squares)
+ * Solves A^T A x = A^T b for x
+ * ----------------------------------------------------------------------- */
+
+/* Helper: A * x (Forward projection) */
+static void ops_Ax(RxState *s, const float *d_x, float *d_ax,
+                   int num_measurements) {
+  float alpha = 1.0f, beta = 0.0f;
+  int batch_size = BATCH_SIZE;
+  int processed = 0;
+
+  /* Reset RNG to beginning of sequence for these measurements */
+  CHECK_CURAND(curandSetPseudoRandomGeneratorSeed(s->curand_gen, s->seed));
+  CHECK_CURAND(curandSetGeneratorOffset(s->curand_gen, 0));
+
+  while (processed < num_measurements) {
+    int chunk = num_measurements - processed;
+    if (chunk > batch_size)
+      chunk = batch_size;
+
+    /* Generate masks */
+    CHECK_CURAND(curandGenerateUniform(s->curand_gen, s->d_masks,
+                                       (size_t)chunk * s->npix));
+    int threads = 256;
+    int blocks = ((size_t)chunk * s->npix + threads - 1) / threads;
+    float_to_mask<<<blocks, threads>>>(s->d_masks, chunk * s->npix);
+
+    /* d_meas[chunk] = masks[chunk, npix] * d_x[npix] */
+    CHECK_CUBLAS(cublasSgemv(s->cublas, CUBLAS_OP_T, s->npix, chunk, &alpha,
+                             s->d_masks, s->npix, d_x, 1, &beta, s->d_meas, 1));
+
+    /* Copy to output */
+    CHECK_CUDA(cudaMemcpy(d_ax + processed, s->d_meas, chunk * sizeof(float),
+                          cudaMemcpyDeviceToDevice));
+
+    processed += chunk;
+  }
+}
+
+/* Helper: A^T * y (Backward projection) */
+static void ops_ATy(RxState *s, const float *d_y, float *d_aty,
+                    int num_measurements) {
+  float alpha = 1.0f, beta = 1.0f; /* Accumulate! */
+  int batch_size = BATCH_SIZE;
+  int processed = 0;
+
+  CHECK_CUDA(cudaMemset(d_aty, 0, s->npix * sizeof(float)));
+
+  CHECK_CURAND(curandSetPseudoRandomGeneratorSeed(s->curand_gen, s->seed));
+  CHECK_CURAND(curandSetGeneratorOffset(s->curand_gen, 0));
+
+  while (processed < num_measurements) {
+    int chunk = num_measurements - processed;
+    if (chunk > batch_size)
+      chunk = batch_size;
+
+    /* Copy chunk of y to internal buffer */
+    CHECK_CUDA(cudaMemcpy(s->d_meas, d_y + processed, chunk * sizeof(float),
+                          cudaMemcpyDeviceToDevice));
+
+    CHECK_CURAND(curandGenerateUniform(s->curand_gen, s->d_masks,
+                                       (size_t)chunk * s->npix));
+    int threads = 256;
+    int blocks = ((size_t)chunk * s->npix + threads - 1) / threads;
+    float_to_mask<<<blocks, threads>>>(s->d_masks, chunk * s->npix);
+
+    /* accum += masks^T * d_meas */
+    CHECK_CUBLAS(cublasSgemv(s->cublas, CUBLAS_OP_N, s->npix, chunk, &alpha,
+                             s->d_masks, s->npix, s->d_meas, 1, &beta, d_aty,
+                             1));
+
+    processed += chunk;
+  }
+}
+
 extern "C" {
 
 TxState *tx_create(uint64_t seed, int width, int height, const float *h_image) {
@@ -302,6 +378,137 @@ void rx_get_image(RxState *s, uint8_t *h_output, int total_measurements) {
   /* Normalization: accum / N */
   for (int i = 0; i < s->npix; i++) {
     float v = h_accum[i] / (float)total_measurements;
+    if (v < 0.0f)
+      v = 0.0f;
+    if (v > 255.0f)
+      v = 255.0f;
+    h_output[i] = (uint8_t)(v + 0.5f);
+  }
+  free(h_accum);
+}
+
+/* -----------------------------------------------------------------------
+ * Least Squares Solver (CGLS)
+ * ----------------------------------------------------------------------- */
+
+static void axpby(cublasHandle_t handle, int n, float alpha, const float *x,
+                  float beta, float *y) {
+  /* y = alpha*x + beta*y */
+  /* cublasSaxpy does y = alpha*x + y.
+     To do beta*y, we can scale y first. */
+  if (beta != 1.0f)
+    cublasSscal(handle, n, &beta, y, 1);
+  if (alpha != 0.0f)
+    cublasSaxpy(handle, n, &alpha, x, 1, y, 1);
+}
+
+void rx_solve_ls(RxState *s, const float *h_measurements, int count,
+                 int iterations, float tol) {
+  float *d_b = NULL; /* measurements (input) */
+  float *d_x = NULL; /* solution (image) */
+  float *d_r = NULL; /* residual (measurements space) */
+  float *d_s = NULL; /* direction (image space) */
+  float *d_p = NULL; /* conjugate direction (image space) */
+  float *d_q = NULL; /* buffer (measurements space) */
+
+  /* Allocate buffers */
+  CHECK_CUDA(cudaMalloc(&d_b, count * sizeof(float)));
+  CHECK_CUDA(cudaMemcpy(d_b, h_measurements, count * sizeof(float),
+                        cudaMemcpyHostToDevice));
+
+  CHECK_CUDA(cudaMalloc(&d_x, s->npix * sizeof(float)));
+  CHECK_CUDA(cudaMemset(d_x, 0, s->npix * sizeof(float))); /* x0 = 0 */
+
+  /* r0 = b - Ax0 = b */
+  CHECK_CUDA(cudaMalloc(&d_r, count * sizeof(float)));
+  CHECK_CUDA(
+      cudaMemcpy(d_r, d_b, count * sizeof(float), cudaMemcpyDeviceToDevice));
+
+  /* s0 = A^T r0 */
+  CHECK_CUDA(cudaMalloc(&d_s, s->npix * sizeof(float)));
+  ops_ATy(s, d_r, d_s, count);
+
+  /* p0 = s0 */
+  CHECK_CUDA(cudaMalloc(&d_p, s->npix * sizeof(float)));
+  CHECK_CUDA(
+      cudaMemcpy(d_p, d_s, s->npix * sizeof(float), cudaMemcpyDeviceToDevice));
+
+  /* q buffer */
+  CHECK_CUDA(cudaMalloc(&d_q, count * sizeof(float)));
+
+  /* gamma0 = ||s0||^2 */
+  float gamma = 0.0f, gamma_new = 0.0f;
+  cublasSdot(s->cublas, s->npix, d_s, 1, d_s, 1, &gamma);
+
+  float best_gamma = gamma;
+
+  for (int k = 0; k < iterations; k++) {
+    /* q = A p */
+    ops_Ax(s, d_p, d_q, count);
+
+    /* alpha = gamma / ||q||^2 */
+    float norm_q = 0.0f;
+    cublasSdot(s->cublas, count, d_q, 1, d_q, 1, &norm_q);
+    if (norm_q < 1e-9f)
+      break; /* Division by zero check */
+
+    float alpha = gamma / norm_q;
+
+    /* x = x + alpha*p */
+    cublasSaxpy(s->cublas, s->npix, &alpha, d_p, 1, d_x, 1);
+
+    /* r = r - alpha*q */
+    float minus_alpha = -alpha;
+    cublasSaxpy(s->cublas, count, &minus_alpha, d_q, 1, d_r, 1);
+
+    /* s = A^T r */
+    /* Note: we must clear d_s before accumulating or ensure ATy overwrites */
+    /* ops_ATy logic uses cudaMemset(0) initially inside, so we are good */
+    ops_ATy(s, d_r, d_s, count);
+
+    /* gamma_new = ||s||^2 */
+    cublasSdot(s->cublas, s->npix, d_s, 1, d_s, 1, &gamma_new);
+
+    if (gamma_new < tol * best_gamma)
+      break;
+
+    /* beta = gamma_new / gamma */
+    float beta = gamma_new / gamma;
+
+    /* p = s + beta*p */
+    axpby(s->cublas, s->npix, 1.0f, d_s, beta, d_p);
+
+    gamma = gamma_new;
+  }
+
+  /* Save result to s->d_accum for retrieval */
+  /* Note: d_x is float approx of range [0-255] directly or scaled?
+     Encoder outputs dot products.
+     If image is [0,255], measurements are large.
+     Least Squares solves for 'x' in original scale.
+     So x should be roughly [0, 255].
+  */
+  CHECK_CUDA(cudaMemcpy(s->d_accum, d_x, s->npix * sizeof(float),
+                        cudaMemcpyDeviceToDevice));
+
+  cudaFree(d_b);
+  cudaFree(d_x);
+  cudaFree(d_r);
+  cudaFree(d_s);
+  cudaFree(d_p);
+  cudaFree(d_q);
+}
+
+void rx_get_ls_image(RxState *s, uint8_t *h_output) {
+  /* Same as rx_get_image but without division by N,
+     because LS solves for x directly.
+  */
+  float *h_accum = (float *)malloc(s->npix * sizeof(float));
+  CHECK_CUDA(cudaMemcpy(h_accum, s->d_accum, s->npix * sizeof(float),
+                        cudaMemcpyDeviceToHost));
+
+  for (int i = 0; i < s->npix; i++) {
+    float v = h_accum[i]; /* Directly use value */
     if (v < 0.0f)
       v = 0.0f;
     if (v > 255.0f)

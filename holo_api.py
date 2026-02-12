@@ -30,6 +30,11 @@ if os.path.exists(_lib_path):
         _lib.rx_accumulate.restype = None
         _lib.rx_get_image.argtypes = [ctypes.POINTER(RxState), ctypes.POINTER(ctypes.c_uint8), ctypes.c_int]
         _lib.rx_get_image.restype = None
+        
+        _lib.rx_solve_ls.argtypes = [ctypes.POINTER(RxState), ctypes.POINTER(ctypes.c_float), ctypes.c_int, ctypes.c_int, ctypes.c_float]
+        _lib.rx_solve_ls.restype = None
+        _lib.rx_get_ls_image.argtypes = [ctypes.POINTER(RxState), ctypes.POINTER(ctypes.c_uint8)]
+        _lib.rx_get_ls_image.restype = None
     except OSError as e:
         print(f"[WARN] Failed to load libholo.so: {e}")
         _lib = None
@@ -87,6 +92,17 @@ class HoloRx:
     def get_image(self):
         out = np.zeros(self.width * self.height, dtype=np.uint8)
         _lib.rx_get_image(self.ptr, out.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)), self.measurements_count)
+        return out.reshape((self.height, self.width))
+
+    def solve_ls(self, measurements, iterations=20, tol=1e-6):
+        """Solve for image using CGLS (Least Squares). Replaces current accumulation state."""
+        meas_float = measurements.astype(np.float32)
+        count = len(meas_float)
+        # Note: solve_ls OVERWRITES the accumulator with the LS result
+        _lib.rx_solve_ls(self.ptr, meas_float.ctypes.data_as(ctypes.POINTER(ctypes.c_float)), count, iterations, tol)
+        
+        out = np.zeros(self.width * self.height, dtype=np.uint8)
+        _lib.rx_get_ls_image(self.ptr, out.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)))
         return out.reshape((self.height, self.width))
 
     def reset(self):
